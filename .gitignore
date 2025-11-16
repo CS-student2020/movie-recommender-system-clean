@@ -4,15 +4,25 @@
 # Python virtual environment
 venv/
 
-# macOS system file
+# macOS system files
 .DS_Store
 
-# Generated files (should NOT be tracked)
+# Compiled Python files
+__pycache__/
+*.pyc
+
+# Model files
+models/
+*.pth
+
+# Generated similarity matrices (big auto-generated files)
 similarity_matrix.csv
 similarity_matrix_item_based.csv
 user_movie_matrix.csv
 
-# Generated data inside folder
+# Generated matrices inside data folder
 data/similarity_matrix.csv
-data/similarity_matrix_item_based.csv
 data/user_movie_matrix.csv
+
+# Optional: ignore JSON exports if auto-generated
+data/*.json
