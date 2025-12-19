@@ -1,46 +1,59 @@
-import os
-import pandas as pd
-from pymongo import MongoClient
-from dotenv import load_dotenv
-from sklearn.metrics.pairwise import cosine_similarity
+from __future__ import annotations
 
-# Load environment variables
-load_dotenv()
+import logging
 
-# Read dev connection string
-connection_string = os.getenv("MONGO_URI_DEV")
+from .config import load_app_config
+from .logging_utils import configure_logger
+from .mongo_loader import load_movies_and_ratings
+from .similarity_engine import UserUserCosineSimilarityEngine
+from .writers import save_similarity_matrix_to_csv
 
-if not connection_string:
-    raise ValueError("❌ ERROR: MONGO_URI_DEV not found in .env file!")
 
-# Connect to MongoDB via dev user
-client = MongoClient(connection_string)
+def main() -> None:
+    """
+    Entry point for computing the user-user cosine similarity matrix.
 
-# Select db and collections
-db = client["movie_recommender_db"]
-movies_collection = db["movies"]
-ratings_collection = db["ratings"]
+    Steps:
+        1. Load configuration (Mongo, output paths).
+        2. Initialize logger.
+        3. Load movies and ratings from MongoDB.
+        4. Compute user-user similarity matrix from ratings.
+        5. Save the similarity matrix to CSV.
+    """
+    logger = configure_logger(name="recommender.similarity", level=logging.INFO)
 
-# Load data from MongoDB
-movies_data = list(movies_collection.find({}, {"_id": 0}))
-ratings_data = list(ratings_collection.find({}, {"_id": 0}))
+    logger.info(
+        "Starting user-user similarity computation pipeline",
+        extra={"event": "pipeline_start"},
+    )
 
-movies_df = pd.DataFrame(movies_data)
-ratings_df = pd.DataFrame(ratings_data)
+    # Load configuration
+    app_config = load_app_config()
 
-# Prepare user-movie matrix
-pivot_df = ratings_df.pivot(index="userId", columns="movieId", values="rating").fillna(0)
+    # Load data
+    movies_df, ratings_df = load_movies_and_ratings(
+        config=app_config.mongo,
+        logger=logger,
+    )
 
-# Compute similarity matrix using cosine similarity
-similarity_matrix = cosine_similarity(pivot_df)
+    # Compute similarity
+    engine = UserUserCosineSimilarityEngine(logger=logger)
+    similarity_df = engine.run_full_pipeline(ratings_df)
 
-similarity_df = pd.DataFrame(
-    similarity_matrix,
-    index=pivot_df.index,
-    columns=pivot_df.index
-)
+    # Save CSV
+    save_similarity_matrix_to_csv(
+        similarity_df=similarity_df,
+        output_path=app_config.similarity.user_user_output_csv_path,
+        logger=logger,
+    )
 
-# Save similarity matrix
-similarity_df.to_csv("similarity_matrix.csv", encoding="utf-8-sig")
 
-print("✅ Similarity matrix created and saved as similarity_matrix.csv")
+    logger.info(
+        "User-user similarity computation pipeline finished successfully",
+        extra={"event": "pipeline_end"},
+    )
+    print(f"✅ Similarity matrix created and saved to {app_config.similarity.user_user_output_csv_path}")
+
+
+if __name__ == "__main__":
+    main()

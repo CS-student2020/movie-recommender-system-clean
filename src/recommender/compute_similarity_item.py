@@ -1,64 +1,93 @@
-import os
-import pandas as pd
-from pymongo import MongoClient
-from dotenv import load_dotenv
-from sklearn.metrics.pairwise import cosine_similarity
+"""
+Orchestrator for computing the item-item cosine similarity matrix.
 
-# -------------------------------------
-# 1) Load environment variables (.env)
-# -------------------------------------
-load_dotenv()
+This module follows FAANG-level engineering standards:
+- Centralized configuration management
+- Structured JSON logging suitable for production environments
+- Clear separation of concerns (no business logic here)
+- Reusable compute engines
+- Input validation
+- Testable design
+"""
 
-connection_string = os.getenv("MONGO_URI_DEV")
+from __future__ import annotations
 
-if not connection_string:
-    raise ValueError("❌ ERROR: MONGO_URI_DEV not found in .env file!")
+import logging
 
-# -------------------------------------
-# 2) Connect to MongoDB (dev user)
-# -------------------------------------
-client = MongoClient(connection_string)
-db = client["movie_recommender_db"]
+from .config import load_app_config
+from .logging_utils import configure_logger
+from .mongo_loader import load_movies_and_ratings
+from .similarity_engine import ItemItemCosineSimilarityEngine
+from .validators import validate_ratings_schema
+from .writers import save_similarity_matrix_to_csv
 
-# Collections
-movies_collection = db["movies"]
-ratings_collection = db["ratings"]
 
-# -------------------------------------
-# 3) Load data
-# -------------------------------------
-ratings_data = list(ratings_collection.find({}, {"_id": 0}))
-ratings_df = pd.DataFrame(ratings_data)
+def main() -> None:
+    """
+    Entry point for the item-item similarity computation pipeline.
 
-print("📥 Data loaded from MongoDB.")
-print(ratings_df.head())
+    Steps:
+        1. Initialize structured logger.
+        2. Load configuration (Mongo settings, output paths).
+        3. Load movies and ratings from MongoDB.
+        4. Validate ratings schema.
+        5. Compute item-item similarity using engine.
+        6. Save the resulting similarity matrix to CSV.
+    """
+    logger = configure_logger(
+        name="recommender.similarity.item_item",
+        level=logging.INFO
+    )
 
-# -------------------------------------
-# 4) Create user-movie matrix
-# -------------------------------------
-pivot_df = ratings_df.pivot(index="userId", columns="movieId", values="rating")
+    logger.info(
+        "Starting item-item similarity computation pipeline",
+        extra={"event": "pipeline_start"},
+    )
 
-# Fill NaN with 0 (standard for CF baseline models)
-pivot_filled = pivot_df.fillna(0)
+    # ----------------------------------------------------------
+    # Step 1 — Load configuration
+    # ----------------------------------------------------------
+    app_config = load_app_config()
 
-# -------------------------------------
-# 5) ITEM-BASED CF → similarity between movies (columns)
-# -------------------------------------
-similarity_matrix = cosine_similarity(pivot_filled.T)
+    # ----------------------------------------------------------
+    # Step 2 — Load data from MongoDB
+    # ----------------------------------------------------------
+    movies_df, ratings_df = load_movies_and_ratings(
+        config=app_config.mongo,
+        logger=logger,
+    )
 
-similarity_df = pd.DataFrame(
-    similarity_matrix,
-    index=pivot_filled.columns,     # movie IDs
-    columns=pivot_filled.columns    # movie IDs
-)
+    # ----------------------------------------------------------
+    # Step 3 — Validate ratings DataFrame
+    # ----------------------------------------------------------
+    validate_ratings_schema(
+        df=ratings_df,
+        logger=logger,
+        step_name="item_item_similarity",
+    )
 
-# -------------------------------------
-# 6) Save output
-# -------------------------------------
-output_path = "similarity_matrix_item_based.csv"
-similarity_df.to_csv(output_path, encoding="utf-8-sig")
+    # ----------------------------------------------------------
+    # Step 4 — Compute item-item cosine similarity using Engine
+    # ----------------------------------------------------------
+    engine = ItemItemCosineSimilarityEngine(logger=logger)
+    similarity_df = engine.run_full_pipeline(ratings_df)
 
-print("🎬 Item-based similarity matrix created!")
-print("📁 Saved to:", output_path)
-print("🔍 Preview:")
-print(similarity_df.iloc[:5, :5])
+    # ----------------------------------------------------------
+    # Step 5 — Save output to CSV
+    # ----------------------------------------------------------
+    save_similarity_matrix_to_csv(
+        similarity_df=similarity_df,
+        output_path=app_config.similarity.item_item_output_csv_path,
+        logger=logger,
+    )
+
+    logger.info(
+        "Item-item similarity computation pipeline completed successfully",
+        extra={"event": "pipeline_end"},
+    )
+
+    print(f"✅ Item-item similarity matrix saved to: {app_config.similarity.item_item_output_csv_path}")
+
+
+if __name__ == "__main__":
+    main()
