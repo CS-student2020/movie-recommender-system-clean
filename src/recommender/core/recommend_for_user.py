@@ -1,4 +1,3 @@
-# src/recommender/core/recommend_for_user.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,6 +9,12 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class RecommendParams:
+    """
+    Hyperparameters for collaborative-filtering based recommendations.
+
+    This dataclass is part of the pure *Domain / Code Layer*:
+    it only carries configuration values and has no side effects.
+    """
     top_k: int = 10
     neighbors_k: int = 50              # how many similar users/items to consider
     min_similarity: float = 0.0        # ignore weak/negative sims if you want
@@ -22,7 +27,12 @@ class RecommendParams:
 
 
 class RecommendationError(ValueError):
-    """Raised when recommendation inputs are invalid or user cannot be recommended."""
+    """
+    Raised when recommendation inputs are invalid or the user
+    cannot be recommended.
+
+    This exception class belongs to the pure *Domain / Code Layer*.
+    """
 
 
 def _validate_inputs(
@@ -32,6 +42,12 @@ def _validate_inputs(
     item_item_sim: Optional[pd.DataFrame],
     params: RecommendParams,
 ) -> None:
+    """
+    Validate inputs for the recommendation algorithm.
+
+    Pure validation logic: raises RecommendationError on invalid inputs,
+    but performs no I/O or logging.
+    """
     required_cols = {"userId", "movieId", "rating"}
     missing = required_cols - set(ratings_df.columns)
     if missing:
@@ -63,15 +79,23 @@ def _user_user_scores(
     params: RecommendParams,
 ) -> pd.DataFrame:
     """
-    Predict scores for unseen movies using weighted sum of neighbor ratings:
-      score(m) = sum(sim(u,v)*r(v,m)) / sum(|sim(u,v)|)
+    Predict scores for unseen movies using a user-user CF scheme.
 
-    Returns columns: [movieId, score, support, reasons]
-    where reasons is a list[dict] when params.explain=True, otherwise None.
+    score(m) = sum(sim(u,v) * r(v,m)) / sum(|sim(u,v)|)
+
+    Returns a DataFrame with columns:
+      - movieId
+      - score
+      - support
+      - reasons: list[dict] when params.explain=True, otherwise None
+
+    Pure in-memory computation: no I/O, no logging.
     """
+    # Movies already rated by the target user
     user_rated = ratings_df.loc[ratings_df["userId"] == user_id, ["movieId"]]
     seen_movie_ids = set(user_rated["movieId"].tolist())
 
+    # Similarities to other users (exclude self)
     sims = user_user_sim.loc[user_id].drop(index=user_id, errors="ignore")
     sims = sims.sort_values(ascending=False)
 
@@ -151,11 +175,16 @@ def _item_item_scores(
     params: RecommendParams,
 ) -> pd.DataFrame:
     """
-    Item-based score for unseen movie m using user’s rated items Iu:
-      score(m) = sum(sim(m,i) * r(u,i)) / sum(|sim(m,i)|)
+    Item-based CF score for unseen movie m using the user's rated items Iu:
 
-    Returns columns: [movieId, score, support]
-    (Explainability for item-item will be added in Step 2.3)
+        score(m) = sum(sim(m, i) * r(u, i)) / sum(|sim(m, i)|)
+
+    Returns a DataFrame with columns:
+      - movieId
+      - score
+      - support
+
+    (Explainability for item-item can be extended later.)
     """
     user_hist = ratings_df.loc[ratings_df["userId"] == user_id, ["movieId", "rating"]].copy()
     if user_hist.empty:
@@ -209,48 +238,104 @@ def recommend_for_user(
     params: Optional[RecommendParams] = None,
 ) -> pd.DataFrame:
     """
-    Returns a DataFrame sorted by score desc.
+    Compute top-N movie recommendations for a user using
+    user-user, item-item, or hybrid CF.
 
-    Output columns (always):
-      - movieId
-      - score
-      - support
-      - reasons (None unless params.explain=True AND supported by the scoring path)
+    This function belongs to the pure *Domain / Code Layer*:
+    - It performs in-memory numerical and tabular computations only.
+    - It does NOT read/write files, touch databases, or log.
 
-    If movies_df is provided and contains title, it will be merged in.
+    Parameters
+    ----------
+    user_id:
+        Target user identifier.
+
+    movies_df:
+        Optional metadata DataFrame with at least `movieId` column.
+        If present and has a `title` column, titles are merged into
+        the result; otherwise it is ignored.
+
+    ratings_df:
+        Long-form ratings DataFrame with columns:
+        - userId
+        - movieId
+        - rating
+
+    user_user_sim:
+        User-user similarity matrix (square DataFrame) indexed
+        and columned by userId.
+
+    item_item_sim:
+        Optional item-item similarity matrix (square DataFrame)
+        indexed and columned by movieId. Required when alpha < 1.0.
+
+    params:
+        Recommendation hyperparameters. If None, defaults are used.
+
+    Returns
+    -------
+    pd.DataFrame
+        Sorted by score (descending). Columns:
+        - movieId
+        - score
+        - support
+        - reasons (None unless params.explain=True AND supported)
+        - (optional) title if provided in movies_df
     """
     params = params or RecommendParams()
     _validate_inputs(user_id, ratings_df, user_user_sim, item_item_sim, params)
 
+    # Pure user-user CF scores
     uu = _user_user_scores(user_id, ratings_df, user_user_sim, params)
 
     if params.alpha >= 1.0:
         combined = uu
     else:
+        # Pure item-item CF scores
         ii = _item_item_scores(user_id, ratings_df, item_item_sim, params)
 
         # Make schemas compatible (so merges are clean)
         if "reasons" not in ii.columns:
             ii["reasons"] = None
 
-        merged = pd.merge(uu, ii, on="movieId", how="outer", suffixes=("_uu", "_ii")).fillna(0.0)
+        merged = pd.merge(
+            uu,
+            ii,
+            on="movieId",
+            how="outer",
+            suffixes=("_uu", "_ii"),
+        ).fillna(0.0)
 
-        merged["score"] = params.alpha * merged["score_uu"] + (1.0 - params.alpha) * merged["score_ii"]
+        merged["score"] = (
+            params.alpha * merged["score_uu"] + (1.0 - params.alpha) * merged["score_ii"]
+        )
         merged["support"] = merged["support_uu"].astype(int) + merged["support_ii"].astype(int)
 
-        # For now, in hybrid we keep reasons from user-user only (Step 2.3 will enhance this)
+        # For now, in hybrid we keep reasons from user-user only
         merged["reasons"] = merged.get("reasons_uu", None)
 
-        combined = merged[["movieId", "score", "support", "reasons"]].sort_values("score", ascending=False)
+        combined = merged[["movieId", "score", "support", "reasons"]].sort_values(
+            "score",
+            ascending=False,
+        )
 
     combined = combined.reset_index(drop=True).head(params.top_k)
 
-    # Optional enrichment with titles if provided
+    # Optional enrichment with titles if provided (still in-memory, no I/O)
     if movies_df is not None and "movieId" in movies_df.columns:
         cols = ["movieId"]
         if "title" in movies_df.columns:
             cols.append("title")
-        combined = combined.merge(movies_df[cols].drop_duplicates("movieId"), on="movieId", how="left")
+        combined = combined.merge(
+            movies_df[cols].drop_duplicates("movieId"),
+            on="movieId",
+            how="left",
+        )
 
-    combined = combined.sort_values(["score", "movieId"], ascending=[False, True]).reset_index(drop=True)
+    # Final stable ordering: score desc, movieId asc
+    combined = combined.sort_values(
+        ["score", "movieId"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
     return combined
