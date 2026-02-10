@@ -26,6 +26,41 @@ from ..domain.recommend_for_user import (
 
 
 # ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+
+def _rank_scores(n: int) -> List[float]:
+    """
+    Convert rank positions into a decreasing score in (0, 1].
+
+    This is a pragmatic product-facing fallback when upstream model scores
+    are degenerate (e.g., all equal). It preserves ordering while providing
+    a meaningful relative score for UI/clients.
+
+    Example (n=5): [1.0, 0.9, 0.8, 0.7, 0.6]
+    """
+    if n <= 0:
+        return []
+    if n == 1:
+        return [1.0]
+
+    # Linear decay from 1.0 down to 0.6 across n items.
+    # (Keeps values "human-feeling" and avoids near-zero tails for small n.)
+    return [1.0 - (i / (n - 1)) * 0.4 for i in range(n)]
+
+
+def _scores_are_degenerate(series: pd.Series, eps: float = 1e-9) -> bool:
+    """
+    Return True if a numeric series has effectively no variance.
+    """
+    if series.empty:
+        return True
+    s = series.astype(float)
+    return (float(s.max()) - float(s.min())) < eps
+
+
+# ---------------------------------------------------------------------
 # Typed Return Models
 # ---------------------------------------------------------------------
 
@@ -41,9 +76,12 @@ class Recommendation:
         Internal movie identifier (as used in the dataset).
     score:
         Relevance score for the recommendation. Higher means better.
+        Note: If upstream model scores are degenerate, this may be a
+        rank-derived relative score in (0, 1] to remain meaningful.
     title:
         Optional movie title, if available from movies metadata.
     """
+
     movie_id: int
     score: float
     title: Optional[str] = None
@@ -62,6 +100,7 @@ class SimilarMovie:
         Numeric similarity coefficient (e.g., cosine similarity).
         Range and interpretation depend on the similarity method.
     """
+
     movie_id: int
     similarity: float
 
@@ -144,6 +183,8 @@ class RecommenderService:
         min_score:
             Optional score threshold. If provided, recommendations
             with scores below this value will be filtered out.
+            Note: If upstream scores are degenerate and we fall back to
+            rank-derived scores, `min_score` applies to those derived scores.
         params:
             Optional per-call recommendation parameters. If not provided,
             the service's default_params are used (if any), otherwise
@@ -170,25 +211,63 @@ class RecommenderService:
             params=effective_params,
         )
 
+        # Defensive: handle empty output early
+        if domain_df is None or getattr(domain_df, "empty", True):
+            return []
+
         # Optionally filter by minimum score, if the score column exists.
+        # (We may re-apply a similar filter after rank-score fallback.)
         if min_score is not None and "score" in domain_df.columns:
             domain_df = domain_df[domain_df["score"] >= min_score]
+
+        if domain_df.empty:
+            return []
+
+        # Decide whether to use rank-derived score fallback.
+        use_rank_score = False
+        if "score" not in domain_df.columns:
+            use_rank_score = True
+        else:
+            use_rank_score = _scores_are_degenerate(domain_df["score"])
+
+        # Reset index for stable rank scoring and iteration
+        domain_df = domain_df.reset_index(drop=True)
+
+        rank_score_list: Optional[List[float]] = None
+        if use_rank_score:
+            rank_score_list = _rank_scores(len(domain_df))
+
+            # If min_score was requested but upstream scores were degenerate,
+            # apply the filter on rank-derived scores too.
+            if min_score is not None:
+                keep_idx = [i for i, s in enumerate(rank_score_list) if s >= min_score]
+                domain_df = domain_df.loc[keep_idx].reset_index(drop=True)
+                rank_score_list = [rank_score_list[i] for i in keep_idx]
+
+            if domain_df.empty:
+                return []
 
         # Map the domain DataFrame to a list of typed Recommendation objects.
         # Expected columns: movieId, score, support, reasons, optional title.
         has_title = "title" in domain_df.columns
 
         recommendations: List[Recommendation] = []
-        for _, row in domain_df.iterrows():
+        for i, (_, row) in enumerate(domain_df.iterrows()):
             title_val: Optional[str] = None
             if has_title:
                 val = row["title"]
                 if isinstance(val, str):
                     title_val = val
+
+            if use_rank_score and rank_score_list is not None:
+                score_val = float(rank_score_list[i])
+            else:
+                score_val = float(row["score"])
+
             recommendations.append(
                 Recommendation(
                     movie_id=int(row["movieId"]),
-                    score=float(row["score"]),
+                    score=score_val,
                     title=title_val,
                 )
             )
