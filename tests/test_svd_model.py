@@ -4,7 +4,7 @@ import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
-from recommender.svd_model import MatrixFactorization
+from recommender.models.svd_model import MatrixFactorization
 
 def test_svd_model_training():
     base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data"))

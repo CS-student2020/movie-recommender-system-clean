@@ -8,6 +8,9 @@ venv/
 .DS_Store
 
 # Compiled Python files
+.pytest_cache/
+*.pyo
+
 __pycache__/
 *.pyc
 
@@ -26,3 +29,15 @@ data/user_movie_matrix.csv
 
 # Optional: ignore JSON exports if auto-generated
 data/*.json
+__pycache__/
+*.pyc
+
+# =========================
+# Generated ML artifacts
+# =========================
+data/*similarity*.csv
+data/user_movie_matrix.csv
+models/*.pth
+
+# Pytest cache
+.pytest_cache/

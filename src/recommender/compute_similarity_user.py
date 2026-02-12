@@ -1,46 +1,50 @@
-import os
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
 import pandas as pd
-from pymongo import MongoClient
-from dotenv import load_dotenv
-from sklearn.metrics.pairwise import cosine_similarity
 
-# Load environment variables
-load_dotenv()
+from .similarity_engine import UserUserCosineSimilarityEngine
 
-# Read dev connection string
-connection_string = os.getenv("MONGO_URI_DEV")
 
-if not connection_string:
-    raise ValueError("❌ ERROR: MONGO_URI_DEV not found in .env file!")
+def compute_user_user_similarity(
+    ratings_df: pd.DataFrame,
+    logger: Optional[logging.Logger] = None,
+) -> pd.DataFrame:
+    """
+    Compute the user–user similarity matrix from the given ratings DataFrame.
 
-# Connect to MongoDB via dev user
-client = MongoClient(connection_string)
+    This is a pure domain function:
+        - It does NOT talk to MongoDB.
+        - It does NOT load configuration.
+        - It does NOT write to disk.
+        - It only uses the similarity engine to transform ratings -> similarity.
 
-# Select db and collections
-db = client["movie_recommender_db"]
-movies_collection = db["movies"]
-ratings_collection = db["ratings"]
+    Parameters
+    ----------
+    ratings_df:
+        A DataFrame of user-item ratings. Typically with columns like:
+            - userId
+            - movieId
+            - rating
+            - (optionally) timestamp
 
-# Load data from MongoDB
-movies_data = list(movies_collection.find({}, {"_id": 0}))
-ratings_data = list(ratings_collection.find({}, {"_id": 0}))
+    logger:
+        Optional logger instance. If not provided, a default module-level logger
+        will be used.
 
-movies_df = pd.DataFrame(movies_data)
-ratings_df = pd.DataFrame(ratings_data)
+    Returns
+    -------
+    pd.DataFrame
+        A user–user similarity matrix, where:
+            - index: userId
+            - columns: userId
+            - values: similarity scores (e.g., cosine similarity).
+    """
+    effective_logger = logger or logging.getLogger("recommender.similarity.user_user")
 
-# Prepare user-movie matrix
-pivot_df = ratings_df.pivot(index="userId", columns="movieId", values="rating").fillna(0)
+    engine = UserUserCosineSimilarityEngine(logger=effective_logger)
+    similarity_df = engine.run_full_pipeline(ratings_df)
 
-# Compute similarity matrix using cosine similarity
-similarity_matrix = cosine_similarity(pivot_df)
-
-similarity_df = pd.DataFrame(
-    similarity_matrix,
-    index=pivot_df.index,
-    columns=pivot_df.index
-)
-
-# Save similarity matrix
-similarity_df.to_csv("similarity_matrix.csv", encoding="utf-8-sig")
-
-print("✅ Similarity matrix created and saved as similarity_matrix.csv")
+    return similarity_df
