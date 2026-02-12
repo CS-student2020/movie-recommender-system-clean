@@ -8,7 +8,7 @@ A production-oriented movie recommendation system designed with a clean, layered
 
 🚧 **Work in Progress**
 
-This project is currently undergoing a **major architectural refactor** toward a Clean Architecture structure:
+This project has undergone a **major architectural refactor** toward a Clean Architecture structure:
 
 - Domain / Core (pure business logic, no I/O)
 - Service layer (orchestration)
@@ -25,7 +25,9 @@ Older structures may still exist in the commit history.
 - Matrix Factorization (SVD-style) model
 - Similarity computation (user-user, item-item)
 - Ranking and recommendation orchestration
-- Fully unit-tested core modules
+- Production-ready FastAPI delivery layer
+- Offline evaluation with reproducible metrics
+- Fully unit-tested core and integration-tested contracts
 
 ---
 
@@ -34,6 +36,7 @@ Older structures may still exist in the commit history.
 - Python
 - Pandas / NumPy
 - PyTorch (matrix factorization)
+- FastAPI
 - Pytest
 
 ---
@@ -43,15 +46,16 @@ Older structures may still exist in the commit history.
 - Demonstrate clean architecture principles in a real ML system
 - Separate business logic from infrastructure concerns
 - Build a recommender system that is **production-ready**, not tutorial-style
+- Apply BigTech-level engineering practices (contracts, tests, evaluation)
 
 ---
 
 ## Roadmap
 
-- [ ] Complete Domain/Core refactor
-- [ ] Finalize Service layer
-- [ ] API layer (FastAPI)
-- [ ] Evaluation and metrics
+- [x] Complete Domain/Core refactor
+- [x] Finalize Service layer
+- [x] API layer (FastAPI)
+- [x] Evaluation and metrics
 - [ ] Deployment and observability
 
 ---
@@ -90,6 +94,7 @@ Infrastructure and data modules provide inputs to the service layer.
 - Delivery layer implemented with FastAPI.
 - Exposes HTTP endpoints and request/response schemas.
 - Contains no business logic.
+- Enforces error contracts and request lifecycle observability.
 
 **Infrastructure / Data**
 - Handles persistence and external systems (MongoDB, CSV/JSON, loaders, writers).
@@ -97,9 +102,8 @@ Infrastructure and data modules provide inputs to the service layer.
 - Supplies data to the service layer.
 - Precomputed similarity matrices are generated via the data preparation pipeline and are intentionally not versioned.
 
-
 **Scripts (`scripts/`)**
-- One-off runnable utilities and demos (e.g. Mongo smoke tests).
+- One-off runnable utilities and demos (e.g. evaluation runners, Mongo smoke tests).
 - Kept outside `src/` to maintain an import-safe package structure.
 
 ### Key Design Principle
@@ -109,14 +113,30 @@ Infrastructure and data modules provide inputs to the service layer.
 
 ---
 
-## Testing Strategy
+## Evaluation (Offline)
 
-- Unit tests focus on pure domain logic.
-- Domain modules are deterministic and fully isolated.
-- Infrastructure and data access are tested separately.
-- All tests must pass before changes are merged.
+This project includes a reproducible offline evaluation protocol for recommendation quality.
 
-Run tests locally with:
+### Protocol (Leakage-safe)
+
+- Split: per-user holdout (leave-one-out)
+- For each eligible user (>= 2 interactions):
+  - test item = last interaction
+  - train = remaining interactions
+- Candidates: global train universe, excluding items already seen in train per user
+
+### Metrics
+
+- Precision@K
+- Recall@K
+
+### Baselines
+
+- Popularity baseline (global most-popular items)
+- Random baseline (deterministic via seed)
+
+### Run evaluation
 
 ```bash
-pytest
+make eval
+make eval_md
