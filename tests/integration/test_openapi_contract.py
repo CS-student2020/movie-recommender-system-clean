@@ -1,7 +1,7 @@
-import pytest
-pytestmark = pytest.mark.integration
 
 from __future__ import annotations
+import pytest
+pytestmark = pytest.mark.integration
 
 from typing import Any, Dict
 
