@@ -1,3 +1,6 @@
+import pytest
+pytestmark = pytest.mark.integration
+
 import pandas as pd
 
 from recommender.evaluation.runner import evaluate_baselines
