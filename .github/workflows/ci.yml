@@ -27,4 +27,7 @@ jobs:
       - name: Run tests
         run: |
           pytest -q
+      
+      - name: Evaluation Gate (baseline quality)
+        run: make eval-gate ARGS="--no-enforce-model"
 
