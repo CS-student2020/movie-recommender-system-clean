@@ -75,5 +75,4 @@ clean:
 # Evaluation Gate (CI-safe)
 # --------------------------------------------------------------
 eval-gate:
-	$(VENV) \
-	$(PYTHON) -m src.recommender.evaluation.cli_gate $(ARGS)
+	python -m src.recommender.evaluation.cli_gate $(ARGS)
