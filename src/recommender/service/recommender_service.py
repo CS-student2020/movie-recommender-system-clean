@@ -15,13 +15,14 @@ Data and algorithm execution dependencies are injected from the outside
 """
 
 from dataclasses import dataclass, replace
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
 from ..domain.recommend_for_user import (
-    recommend_for_user,
     RecommendParams,
+    RecommendationError,
+    recommend_for_user,
 )
 
 
@@ -58,6 +59,78 @@ def _scores_are_degenerate(series: pd.Series, eps: float = 1e-9) -> bool:
         return True
     s = series.astype(float)
     return (float(s.max()) - float(s.min())) < eps
+
+
+def _popularity_ranking(ratings_df: pd.DataFrame) -> List[int]:
+    """
+    Global popularity ranking by interaction count.
+
+    Deterministic: stable for identical inputs.
+    """
+    if ratings_df is None or ratings_df.empty:
+        return []
+    if "movieId" not in ratings_df.columns:
+        return []
+    counts = ratings_df["movieId"].astype(int).value_counts()
+    return counts.index.astype(int).tolist()
+
+
+def _fallback_popularity_recs(
+    *,
+    user_id: int,
+    limit: int,
+    ratings_df: pd.DataFrame,
+    movies_df: pd.DataFrame,
+) -> List["Recommendation"]:
+    """
+    Product fallback: return popularity-based recommendations.
+
+    Requirements:
+    - Must not crash.
+    - Exclude already seen items when possible.
+    - Respect the requested limit K.
+    """
+    ranked = _popularity_ranking(ratings_df)
+
+    # Exclude items the user already rated/seen (best effort).
+    seen: set[int] = set()
+    try:
+        if ratings_df is not None and not ratings_df.empty and "userId" in ratings_df.columns:
+            seen = set(
+                ratings_df.loc[ratings_df["userId"] == user_id, "movieId"]
+                .astype(int)
+                .tolist()
+            )
+    except Exception:
+        seen = set()
+
+    candidates = [mid for mid in ranked if mid not in seen]
+    chosen = candidates[: max(0, limit)]
+
+    if not chosen:
+        return []
+
+    # Best-effort title mapping.
+    title_map: Dict[int, str] = {}
+    try:
+        if movies_df is not None and not movies_df.empty and "movieId" in movies_df.columns:
+            tmp = movies_df[["movieId", "title"]].copy()
+            tmp["movieId"] = tmp["movieId"].astype(int)
+            title_map = dict(zip(tmp["movieId"].tolist(), tmp["title"].tolist()))
+    except Exception:
+        title_map = {}
+
+    scores = _rank_scores(len(chosen))
+    out: List[Recommendation] = []
+    for mid, score in zip(chosen, scores):
+        out.append(
+            Recommendation(
+                movie_id=int(mid),
+                score=float(score),
+                title=title_map.get(int(mid)),
+            )
+        )
+    return out
 
 
 # ---------------------------------------------------------------------
@@ -133,23 +206,6 @@ class RecommenderService:
         item_item_sim: pd.DataFrame,
         default_params: Optional[RecommendParams] = None,
     ) -> None:
-        """
-        Construct a RecommenderService instance.
-
-        Parameters
-        ----------
-        ratings_df:
-            Pre-loaded ratings data as a pandas DataFrame.
-        movies_df:
-            Pre-loaded movies metadata as a pandas DataFrame.
-        user_user_sim:
-            Pre-loaded user-user similarity matrix as a pandas DataFrame.
-        item_item_sim:
-            Pre-loaded item-item similarity matrix as a pandas DataFrame.
-        default_params:
-            Optional default recommendation hyperparameters. If None,
-            the domain-level defaults will be used.
-        """
         self._ratings_df = ratings_df
         self._movies_df = movies_df
         self._user_user_sim = user_user_sim
@@ -170,25 +226,10 @@ class RecommenderService:
         """
         Retrieve recommendations for a given user.
 
-        This method orchestrates the call to the domain layer
-        (e.g., collaborative filtering + ranking) and maps the result
-        into a type-safe list of Recommendation objects.
-
-        Parameters
-        ----------
-        user_id:
-            User identifier in the dataset.
-        limit:
-            Maximum number of recommendations to return.
-        min_score:
-            Optional score threshold. If provided, recommendations
-            with scores below this value will be filtered out.
-            Note: If upstream scores are degenerate and we fall back to
-            rank-derived scores, `min_score` applies to those derived scores.
-        params:
-            Optional per-call recommendation parameters. If not provided,
-            the service's default_params are used (if any), otherwise
-            domain defaults are used.
+        Product Behavior Spec alignment (v1):
+        - Cold start (no history) => fallback to popularity.
+        - Model failure => fallback to popularity.
+        - Empty model output => fallback to popularity.
 
         Returns
         -------
@@ -202,26 +243,65 @@ class RecommenderService:
         if effective_params.top_k != limit:
             effective_params = replace(effective_params, top_k=limit)
 
-        domain_df = recommend_for_user(
-            user_id=user_id,
-            movies_df=self._movies_df,
-            ratings_df=self._ratings_df,
-            user_user_sim=self._user_user_sim,
-            item_item_sim=self._item_item_sim,
-            params=effective_params,
-        )
+        # --- Product behavior (Spec v1): cold start fallback ---
+        try:
+            user_history_count = int((self._ratings_df["userId"] == user_id).sum())
+        except Exception:
+            user_history_count = 0
 
-        # Defensive: handle empty output early
+        if user_history_count == 0:
+            return _fallback_popularity_recs(
+                user_id=user_id,
+                limit=limit,
+                ratings_df=self._ratings_df,
+                movies_df=self._movies_df,
+            )
+
+        # --- Model attempt with safe fallback on failure ---
+        try:
+            domain_df = recommend_for_user(
+                user_id=user_id,
+                movies_df=self._movies_df,
+                ratings_df=self._ratings_df,
+                user_user_sim=self._user_user_sim,
+                item_item_sim=self._item_item_sim,
+                params=effective_params,
+            )
+        except RecommendationError:
+            return _fallback_popularity_recs(
+                user_id=user_id,
+                limit=limit,
+                ratings_df=self._ratings_df,
+                movies_df=self._movies_df,
+            )
+        except Exception:
+            return _fallback_popularity_recs(
+                user_id=user_id,
+                limit=limit,
+                ratings_df=self._ratings_df,
+                movies_df=self._movies_df,
+            )
+
+        # Defensive: handle empty output early => fallback (Spec v1)
         if domain_df is None or getattr(domain_df, "empty", True):
-            return []
+            return _fallback_popularity_recs(
+                user_id=user_id,
+                limit=limit,
+                ratings_df=self._ratings_df,
+                movies_df=self._movies_df,
+            )
 
         # Optionally filter by minimum score, if the score column exists.
-        # (We may re-apply a similar filter after rank-score fallback.)
         if min_score is not None and "score" in domain_df.columns:
             domain_df = domain_df[domain_df["score"] >= min_score]
 
         if domain_df.empty:
-            return []
+            return _fallback_popularity_recs(
+                user_id=user_id,
+                limit=limit,
+                ratings_df=self._ratings_df,
+                movies_df=self._movies_df,
+            )
 
         # Decide whether to use rank-derived score fallback.
         use_rank_score = False
@@ -230,7 +310,6 @@ class RecommenderService:
         else:
             use_rank_score = _scores_are_degenerate(domain_df["score"])
 
-        # Reset index for stable rank scoring and iteration
         domain_df = domain_df.reset_index(drop=True)
 
         rank_score_list: Optional[List[float]] = None
@@ -245,10 +324,13 @@ class RecommenderService:
                 rank_score_list = [rank_score_list[i] for i in keep_idx]
 
             if domain_df.empty:
-                return []
+                return _fallback_popularity_recs(
+                    user_id=user_id,
+                    limit=limit,
+                    ratings_df=self._ratings_df,
+                    movies_df=self._movies_df,
+                )
 
-        # Map the domain DataFrame to a list of typed Recommendation objects.
-        # Expected columns: movieId, score, support, reasons, optional title.
         has_title = "title" in domain_df.columns
 
         recommendations: List[Recommendation] = []
@@ -272,7 +354,6 @@ class RecommenderService:
                 )
             )
 
-        # Enforce the `limit` at the service boundary as well.
         return recommendations[:limit]
 
     # ------------------------------------------------------------------
@@ -285,29 +366,6 @@ class RecommenderService:
         limit: int = 10,
         min_similarity: Optional[float] = None,
     ) -> List[SimilarMovie]:
-        """
-        Retrieve movies similar to a given reference movie.
-
-        Parameters
-        ----------
-        movie_id:
-            Movie identifier to compute similarity against.
-        limit:
-            Maximum number of similar movies to return.
-        min_similarity:
-            Optional threshold to filter out weak similarities.
-
-        Returns
-        -------
-        List[SimilarMovie]
-            List of typed SimilarMovie objects. Length is at most `limit`.
-
-        Notes
-        -----
-        This is a placeholder. In a later iteration, this method will invoke
-        a similarity engine from the domain layer (e.g., cosine similarity
-        over a precomputed similarity matrix).
-        """
         raise NotImplementedError(
             "get_similar_movies is not implemented yet. "
             "It will be wired to domain similarity computations "
