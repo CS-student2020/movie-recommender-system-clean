@@ -25,6 +25,9 @@ logger = configure_logger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
+# Do not emit request completion logs for health endpoints
+HEALTHCHECK_PATHS = {"/v1/health", "/v1/ready"}
+
 
 async def _bootstrap_in_background(app: FastAPI) -> None:
     """
@@ -37,7 +40,6 @@ async def _bootstrap_in_background(app: FastAPI) -> None:
             extra={"event": "bootstrap.bg_start"},
         )
 
-        # bootstrap_service() is synchronous and may be heavy (Mongo + pandas)
         service = await asyncio.to_thread(bootstrap_service)
 
         app.state.recommender_service = service
@@ -47,6 +49,7 @@ async def _bootstrap_in_background(app: FastAPI) -> None:
             "Background bootstrap finished; application marked as ready",
             extra={"event": "bootstrap.bg_ready"},
         )
+
     except Exception:
         app.state.is_ready = False
         logger.exception(
@@ -65,13 +68,12 @@ async def lifespan(app: FastAPI):
     app.state.is_ready = False
     app.state.recommender_service = None
 
-    # Start background bootstrap task
     task = asyncio.create_task(_bootstrap_in_background(app))
     app.state.bootstrap_task = task
 
     yield
 
-    # Optional: graceful shutdown for the background task
+    # Graceful shutdown
     task = getattr(app.state, "bootstrap_task", None)
     if task is not None and not task.done():
         task.cancel()
@@ -91,62 +93,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Ensure readiness state exists even in unusual contexts
+# Ensure readiness flag always exists
 if not hasattr(app.state, "is_ready"):
     app.state.is_ready = False
-
-
-# Option 1 (FAANG-grade): do not emit "request completed" logs for health checks
-HEALTHCHECK_PATHS = {"/v1/health", "/v1/ready"}
-
-@app.middleware("http")
-async def request_context_middleware(request: Request, call_next):
-    """
-    Attach a request id to every request and emit structured request lifecycle logs.
-    """
-    request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex
-    request.state.request_id = request_id
-
-    start = time.perf_counter()
-    response = None
-    try:
-        response = await call_next(request)
-        return response
-    finally:
-        duration_ms = round((time.perf_counter() - start) * 1000.0, 2)
-        status_code = getattr(response, "status_code", None)
-        path = request.url.path
-
-        # Option 1: skip access-style logs for health checks to avoid log noise
-        if path not in HEALTHCHECK_PATHS:
-            logger.info(
-                "Request completed",
-                extra={
-                    "event": "request.completed",
-                    "request_id": request_id,
-                    "method": request.method,
-                    "path": path,
-                    "status_code": status_code,
-                    "duration_ms": duration_ms,
-                },
-            )
-
-        if response is not None:
-            response.headers[REQUEST_ID_HEADER] = request_id
 
 
 @app.middleware("http")
 async def readiness_gate_middleware(request: Request, call_next):
     """
-    FAANG-grade global readiness gate:
+    Global readiness gate:
     - Before app is ready, allow ONLY /v1/health and /v1/ready.
     - All other routes return 503 with a stable error payload.
-    This prevents "Empty reply" / unpredictable responses during warm-up.
     """
     path = request.url.path
 
-    # Allow liveness/readiness endpoints even when not ready
-    if path in ("/v1/health", "/v1/ready"):
+    if path in HEALTHCHECK_PATHS:
         return await call_next(request)
 
     is_ready = bool(getattr(request.app.state, "is_ready", False))
@@ -174,10 +135,44 @@ async def readiness_gate_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    """
+    Attach a request id and emit structured lifecycle logs.
+    """
+    request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex
+    request.state.request_id = request_id
+
+    start = time.perf_counter()
+    response = None
+
+    try:
+        response = await call_next(request)
+        return response
+
+    finally:
+        duration_ms = round((time.perf_counter() - start) * 1000.0, 2)
+        status_code = getattr(response, "status_code", None)
+        path = request.url.path
+
+        if path not in HEALTHCHECK_PATHS:
+            logger.info(
+                "Request completed",
+                extra={
+                    "event": "request.completed",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": path,
+                    "status_code": status_code,
+                    "duration_ms": duration_ms,
+                },
+            )
+
+        if response is not None:
+            response.headers[REQUEST_ID_HEADER] = request_id
+
+
 def _map_http_status_to_error_code(status_code: int) -> ErrorCode:
-    """
-    Map HTTP status codes to stable API error codes.
-    """
     mapping: dict[int, ErrorCode] = {
         400: ErrorCode.BAD_REQUEST,
         404: ErrorCode.NOT_FOUND,
@@ -195,9 +190,6 @@ def _error_response(
     request_id: str,
     details: Optional[Any] = None,
 ) -> JSONResponse:
-    """
-    Build a canonical JSON error response.
-    """
     payload = make_error(
         code=code.value,
         message=message,
@@ -213,9 +205,7 @@ def _error_response(
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(
-    request: Request, exc: RequestValidationError
-):
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
     request_id = get_request_id(request)
 
     logger.warning(
@@ -243,15 +233,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     request_id = get_request_id(request)
     code = _map_http_status_to_error_code(exc.status_code)
 
-    if isinstance(exc.detail, str):
-        message = exc.detail
-        details = None
-    elif isinstance(exc.detail, dict):
-        message = "Request failed"
-        details = exc.detail
-    else:
-        message = "Request failed"
-        details = None
+    message = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    details = exc.detail if isinstance(exc.detail, dict) else None
 
     logger.info(
         "HTTP exception raised",
@@ -300,5 +283,3 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 app.include_router(health_router, prefix="/v1")
 app.include_router(recommendations_router, prefix="/v1")
-
-
