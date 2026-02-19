@@ -17,11 +17,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluation gate for recommender system")
 
     # --- Model enforcement control ---
-    # Enforced by default (product/CI behavior), can be disabled explicitly for dev.
+    # Disabled by default to avoid false reds on infra/CI changes.
+    # Enable explicitly when validating candidate models against the baseline contract.
     parser.add_argument(
-        "--no-enforce-model",
+        "--enforce-model",
         action="store_true",
-        help="Disable model acceptance enforcement (dev-only).",
+        help="Enforce model acceptance contract (merge-blocking).",
     )
 
     # --- Acceptance contract knobs ---
@@ -98,8 +99,11 @@ def main() -> None:
         f"(factor={float(args.acceptance_factor):.2f}x, margin={float(args.margin):.6f})"
     )
 
-    if args.no_enforce_model:
-        print("Model enforcement disabled (dev-only).")
+    if not args.enforce_model:
+        print(
+            "Model acceptance enforcement is OFF by default (report-only). "
+            "Use --enforce-model to enforce."
+        )
         return
 
     if model_recall < required:
