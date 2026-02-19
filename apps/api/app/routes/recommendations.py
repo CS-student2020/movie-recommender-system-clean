@@ -8,6 +8,7 @@ from __future__ import annotations
 import inspect
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
 from apps.api.app.openapi_examples import standard_error_responses
 from apps.api.app.schemas.errors import ErrorResponse
@@ -27,20 +28,26 @@ router = APIRouter(
 )
 
 
+def _is_ready(request: Request) -> bool:
+    return bool(getattr(request.app.state, "is_ready", False))
+
+
 def get_service(request: Request) -> RecommenderService:
     """
     Retrieve the recommender service from application state.
 
-    The service is expected to be initialized during app startup and stored on
-    `app.state.recommender_service` to avoid request-time cold starts.
+    In production, the service is initialized in background bootstrap and stored on
+    `app.state.recommender_service`. If the app is not ready yet, callers should
+    receive a 503 (handled in the route).
 
-    Falls back to a cached bootstrap for dev/test contexts where startup hooks
-    may not have executed.
+    For dev/test contexts where startup hooks may not have executed, we fall back
+    to a cached bootstrap.
     """
     service = getattr(request.app.state, "recommender_service", None)
     if service is not None:
         return service
 
+    # Dev/Test fallback only (e.g., TestClient contexts)
     return get_recommender_service()
 
 
@@ -54,14 +61,46 @@ def get_service(request: Request) -> RecommenderService:
         **{
             code: {"model": ErrorResponse, **spec}
             for code, spec in standard_error_responses().items()
-        }
+        },
+        503: {
+            "model": ErrorResponse,
+            "description": "Service not ready",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "SERVICE_UNAVAILABLE",
+                            "message": "Service is warming up. Please retry shortly.",
+                            "request_id": "7b2b5a2c4f3a4e1fb7f4f44c9c1c2c9a",
+                        }
+                    }
+                }
+            },
+        },
     },
 )
 def get_recommendations(
+    request: Request,
     user_id: int,
     params: RecommendationQueryParams = Depends(),
     service: RecommenderService = Depends(get_service),
 ):
+    # FAANG-grade: reject traffic until bootstrap is complete
+    if not _is_ready(request):
+        # Keep response shape aligned with ErrorResponse schema:
+        # {"error": {"code": "...", "message": "...", "request_id": "...", ...}}
+        request_id = request.headers.get("X-Request-ID") or getattr(
+            request.state, "request_id", None
+        )
+        payload = {
+            "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Service is warming up. Please retry shortly.",
+                "request_id": request_id,
+            }
+        }
+        return JSONResponse(status_code=503, content=payload)
+
     logger.info(
         "recommendation_request",
         extra={

@@ -1,4 +1,3 @@
-
 import sys
 import argparse
 import pandas as pd
@@ -8,19 +7,55 @@ from .model_runner import evaluate_model_on_holdout
 from .protocol import apply_baseline_gate
 
 
+# Default acceptance contract:
+# model_recall must be at least popularity_recall * factor (+ margin)
+DEFAULT_ACCEPTANCE_FACTOR = 1.10
+DEFAULT_MARGIN = 0.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluation gate for recommender system")
+
+    # --- Model enforcement control ---
+    # Disabled by default to avoid false reds on infra/CI changes.
+    # Enable explicitly when validating candidate models against the baseline contract.
     parser.add_argument(
         "--enforce-model",
         action="store_true",
-        help="Fail if model does not beat popularity baseline",
+        help="Enforce model acceptance contract (merge-blocking).",
+    )
+
+    # --- Acceptance contract knobs ---
+    parser.add_argument(
+        "--acceptance-factor",
+        type=float,
+        default=DEFAULT_ACCEPTANCE_FACTOR,
+        help=(
+            "Acceptance factor over popularity baseline. "
+            "Requirement: model_recall >= popularity_recall * factor + margin"
+        ),
     )
     parser.add_argument(
         "--margin",
         type=float,
-        default=0.0,
-        help="Required margin over popularity baseline (recall@k)",
+        default=DEFAULT_MARGIN,
+        help="Additional required margin added after factor scaling (recall@k).",
     )
+
+    # (Optional) allow changing k/seed if you ever want it later, but keep stable defaults now.
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=10,
+        help="Top-K for evaluation metrics (default: 10).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for deterministic evaluation (default: 42).",
+    )
+
     args = parser.parse_args()
 
     ratings = pd.read_csv("tests/fixtures/ratings_small.csv")
@@ -29,8 +64,8 @@ def main() -> None:
     # ---- Baseline gate (always enforced) ----
     baseline_metrics = evaluate_baselines(
         ratings=ratings,
-        top_k=10,
-        seed=42,
+        top_k=args.k,
+        seed=args.seed,
     )
     baseline_result = apply_baseline_gate(baseline_metrics)
 
@@ -41,36 +76,42 @@ def main() -> None:
     if not baseline_result.passed:
         sys.exit(1)
 
-    # ---- Model evaluation (optional enforcement) ----
+    # ---- Model evaluation (always computed; enforcement optional) ----
     model_metrics = evaluate_model_on_holdout(
         ratings=ratings,
         movies=movies,
-        top_k=10,
-        seed=42,
+        top_k=args.k,
+        seed=args.seed,
     )
 
     print("\nModel Metrics:")
     print(model_metrics)
 
-    if args.enforce_model:
-        model_recall = model_metrics["model"]["recall@k"]
-        baseline_recall = baseline_metrics["popularity"]["recall@k"]
+    model_recall = float(model_metrics["model"]["recall@k"])
+    popularity_recall = float(baseline_metrics["popularity"]["recall@k"])
 
-        required = baseline_recall + args.margin
+    required = (popularity_recall * float(args.acceptance_factor)) + float(args.margin)
 
+    print(
+        "\nModel Acceptance Gate: "
+        f"model_recall={model_recall:.6f}, "
+        f"required>={required:.6f} "
+        f"(factor={float(args.acceptance_factor):.2f}x, margin={float(args.margin):.6f})"
+    )
+
+    if not args.enforce_model:
         print(
-            f"\nModel-vs-Baseline Gate: "
-            f"model_recall={model_recall:.6f}, "
-            f"required>={required:.6f}"
+            "Model acceptance enforcement is OFF by default (report-only). "
+            "Use --enforce-model to enforce."
         )
+        return
 
-        if model_recall < required:
-            print("Model-vs-Baseline gate FAILED")
-            sys.exit(1)
+    if model_recall < required:
+        print("Model Acceptance gate FAILED")
+        sys.exit(1)
 
-        print("Model-vs-Baseline gate PASSED")
+    print("Model Acceptance gate PASSED")
 
 
 if __name__ == "__main__":
     main()
-
